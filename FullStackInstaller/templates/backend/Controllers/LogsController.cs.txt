@@ -1,0 +1,79 @@
+using Microsoft.AspNetCore.Mvc;
+using MyProject.Services;
+using System.Text;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
+using System;
+using System.Threading;
+
+namespace MyProject.Controllers
+{
+    [ApiController]
+    [Route("api/[controller]")]
+    public class LogsController : ControllerBase
+    {
+        private readonly LogService _logService;
+        private readonly ILogger<LogsController> _logger;
+
+        public LogsController(LogService logService, ILogger<LogsController> logger)
+        {
+            _logService = logService;
+            _logger = logger;
+        }
+
+        [HttpGet]
+        public async Task GetStream(CancellationToken cancellationToken)
+        {
+            Response.ContentType = "text/event-stream";
+            Response.Headers.Add("Cache-Control", "no-cache");
+            Response.Headers.Add("Connection", "keep-alive");
+
+            var connectionId = Guid.NewGuid().ToString();
+            _logService.AddClient(connectionId, Response);
+
+            cancellationToken.Register(() => _logService.RemoveClient(connectionId));
+
+            try
+            {
+                // Enviar mensagem inicial
+                var initialMessage = $"data: Conectado - {DateTime.Now:HH:mm:ss}\n\n";
+                var bytes = Encoding.UTF8.GetBytes(initialMessage);
+                await Response.Body.WriteAsync(bytes, cancellationToken);
+                await Response.Body.FlushAsync(cancellationToken);
+
+                // Manter conexão aberta
+                var buffer = new byte[4096];
+                while (!cancellationToken.IsCancellationRequested)
+                {
+                    // Ler do pipe para manter conexão viva (previne buffer overflow e permite detecção de desconexão)
+                    await Response.Body.WriteAsync(buffer.AsMemory(0, 0), cancellationToken); // Escreve 0 bytes
+                    await Response.Body.FlushAsync(cancellationToken);
+                    await Task.Delay(TimeSpan.FromMinutes(30), cancellationToken); // Keep-alive a cada 30 minutos
+                }
+            }
+            catch (TaskCanceledException)
+            {
+                // Client disconnected
+            }
+            finally
+            {
+                _logService.RemoveClient(connectionId);
+            }
+        }
+
+        [HttpPost]
+        public async Task<IActionResult> PostLog([FromBody] LogMessageDto log)
+        {
+            if (string.IsNullOrWhiteSpace(log?.Message))
+                return BadRequest("Mensagem é obrigatória");
+
+            await _logService.SendLogAsync(log.Message);
+            return Ok();
+        }
+
+        public class LogMessageDto
+        {
+            public string Message { get; set; } = string.Empty;
+        }
+    }
+}

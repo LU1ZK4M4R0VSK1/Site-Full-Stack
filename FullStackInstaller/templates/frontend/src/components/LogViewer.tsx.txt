@@ -1,0 +1,138 @@
+import { useState, useEffect, useRef } from 'react';
+
+const LogViewer = () => {
+    const [logs, setLogs] = useState<string[]>([]);
+    const [connected, setConnected] = useState(false);
+    const logsEndRef = useRef<HTMLDivElement>(null);
+
+    useEffect(() => {
+                const eventSource = new EventSource('http://localhost:5000/api/logs');
+                let reconnectAttempts = 0;
+                const maxReconnectAttempts = 5;
+                
+                eventSource.onopen = () => {
+                    console.log('SSE conectado');
+                    setConnected(true);
+                    reconnectAttempts = 0; // Reset attempts on successful connection
+                };
+        
+                eventSource.onmessage = (event) => {
+                    if (event.data.trim()) { // Ignora keep-alive vazio
+                        setLogs(prev => [...prev, event.data]);
+                    }
+                };
+        
+                eventSource.onerror = (error) => {
+                    console.error('SSE error:', error);
+                    setConnected(false);
+                    eventSource.close(); // Close current connection
+        
+                    if (reconnectAttempts < maxReconnectAttempts) {
+                        reconnectAttempts++;
+                        console.log(`Tentativa de reconexão ${reconnectAttempts}/${maxReconnectAttempts}...`);
+                        setTimeout(() => {
+                            // Recria o EventSource para tentar reconectar
+                            // A nova instância de EventSource será criada no próximo ciclo do useEffect
+                        }, 3000);
+                    } else {
+                        console.log('Número máximo de tentativas de reconexão excedido. Parando de tentar.');
+                    }
+                };
+        return () => {
+            eventSource.close();
+        };
+    }, []);
+
+    // Auto-scroll
+    useEffect(() => {
+        if (logsEndRef.current) {
+            logsEndRef.current.scrollIntoView({ behavior: 'smooth' });
+        }
+    }, [logs]);
+
+    const clearLogs = () => {
+        setLogs([]);
+    };
+
+    return (
+        <div style={{
+            border: '1px solid #ccc',
+            padding: '15px',
+            marginTop: '20px',
+            height: '400px',
+            overflowY: 'scroll',
+            backgroundColor: '#1e1e1e',
+            color: '#fff',
+            fontFamily: 'Consolas, Monaco, monospace',
+            fontSize: '12px'
+        }}>
+            <div style={{
+                display: 'flex',
+                justifyContent: 'space-between',
+                marginBottom: '10px',
+                alignItems: 'center'
+            }}>
+                <h3 style={{ margin: 0 }}>📋 Logs da Instalação</h3>
+                <div>
+                    <span style={{
+                        padding: '4px 8px',
+                        borderRadius: '4px',
+                        backgroundColor: connected ? '#2ecc71' : '#e74c3c',
+                        color: 'white',
+                        fontSize: '11px',
+                        marginRight: '10px'
+                    }}>
+                        {connected ? '● Conectado' : '● Desconectado'}
+                    </span>
+                    <button
+                        onClick={clearLogs}
+                        style={{
+                            padding: '4px 10px',
+                            backgroundColor: '#34495e',
+                            color: 'white',
+                            border: 'none',
+                            borderRadius: '4px',
+                            cursor: 'pointer'
+                        }}
+                    >
+                        Limpar
+                    </button>
+                </div>
+            </div>
+            
+            {logs.length === 0 ? (
+                <div style={{
+                    textAlign: 'center',
+                    padding: '50px',
+                    color: '#777'
+                }}>
+                    Aguardando logs da instalação...
+                </div>
+            ) : (
+                <div>
+                    {logs.map((log, index) => {
+                        const isError = log.includes('❌') || log.toLowerCase().includes('error');
+                        const isSuccess = log.includes('✅') || log.toLowerCase().includes('sucesso');
+                        
+                        return (
+                            <div
+                                key={index}
+                                style={{
+                                    padding: '4px 0',
+                                    borderBottom: '1px solid #333',
+                                    color: isError ? '#e74c3c' : 
+                                           isSuccess ? '#2ecc71' : '#3498db'
+                                }}
+                            >
+                                {log}
+                            </div>
+                        );
+                    })}
+                    <div ref={logsEndRef} />
+                </div>
+            )}
+        </div>
+    );
+};
+
+export default LogViewer;
