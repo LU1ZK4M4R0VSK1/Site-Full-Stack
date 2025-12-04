@@ -1,308 +1,465 @@
-# Script de configuração do Full Stack Project
+#Requires -Version 5.1
+<#
+.SYNOPSIS
+    Script de instalacao Full Stack (.NET + React)
+.PARAMETER ProjectDir
+    Diretorio onde o projeto sera criado
+#>
 
-# Parâmetros
 param (
-    [string]$ProjectDir
+    [string]$ProjectDir = ""
 )
 
-# --- Configurações ---
+# ==================================================
+# CONFIGURACOES
+# ==================================================
 $BackendPort = 5000
 $BackendUrl = "http://localhost:$BackendPort"
+$HealthCheckTimeout = 30
+$BackendProcess = $null
 
-# Variável global para rastrear o processo do backend
-$global:BackendProcess = $null
-
-# --- Funções ---
-
-# Função para enviar logs para a API do backend (com tentativas)
-function Send-Log {
-    param([string]$Message)
+# ==================================================
+# FUNCOES DE LOG
+# ==================================================
+function Write-Log {
+    param(
+        [string]$Message,
+        [string]$Level = "Info"
+    )
     
-    # Escreve o log no console local
-    Write-Host $Message
+    $icon = switch ($Level) {
+        "Info"    { "INFO" }
+        "Success" { "OK" }
+        "Warning" { "WARN" }
+        "Error"   { "ERRO" }
+        "Header"  { "====" }
+    }
     
-    # Tenta enviar o log para a API do backend 3 vezes
-    for ($i = 0; $i -lt 3; $i++) {
+    $color = switch ($Level) {
+        "Info"    { "Cyan" }
+        "Success" { "Green" }
+        "Warning" { "Yellow" }
+        "Error"   { "Red" }
+        "Header"  { "Magenta" }
+    }
+    
+    Write-Host "[$icon] $Message" -ForegroundColor $color
+    
+    # Tenta enviar para API
+    try {
+        $body = @{ Message = "[$icon] $Message" } | ConvertTo-Json
+        Invoke-RestMethod -Uri "$BackendUrl/api/logs" -Method Post -Body $body -ContentType "application/json" -TimeoutSec 1 -ErrorAction SilentlyContinue | Out-Null
+    }
+    catch {
+        # Ignora erros de envio de log
+    }
+}
+
+# ==================================================
+# VALIDACAO
+# ==================================================
+function Test-Tool {
+    param([string]$Command)
+    
+    $found = Get-Command $Command -ErrorAction SilentlyContinue
+    return ($null -ne $found)
+}
+
+function Test-Prerequisites {
+    Write-Log "Verificando pre-requisitos..." -Level Info
+    
+    $allOk = $true
+    
+    if (Test-Tool "dotnet") {
+        $version = dotnet --version
+        Write-Log "dotnet encontrado: $version" -Level Success
+    }
+    else {
+        Write-Log ".NET SDK nao encontrado!" -Level Error
+        $allOk = $false
+    }
+    
+    if (Test-Tool "npm") {
+        $version = npm --version
+        Write-Log "npm encontrado: $version" -Level Success
+    }
+    else {
+        Write-Log "Node.js/npm nao encontrado!" -Level Error
+        $allOk = $false
+    }
+    
+    if (-not $allOk) {
+        throw "Pre-requisitos nao atendidos"
+    }
+}
+
+# ==================================================
+# GERENCIAMENTO BACKEND
+# ==================================================
+function Start-Backend {
+    param([string]$Path)
+    
+    $backendPath = Join-Path $Path "backend"
+    
+    if (-not (Test-Path $backendPath)) {
+        Write-Log "Backend ainda nao existe" -Level Warning
+        return $false
+    }
+    
+    try {
+        Write-Log "Compilando backend..." -Level Info
+        Push-Location $backendPath
+        
+        dotnet build --verbosity quiet | Out-Null
+        
+        Write-Log "Iniciando servidor backend..." -Level Info
+        
+        $script:BackendProcess = Start-Process -FilePath "dotnet" -ArgumentList "run --urls $BackendUrl" -WorkingDirectory $backendPath -WindowStyle Hidden -PassThru
+        
+        Write-Log "Backend iniciado (PID: $($script:BackendProcess.Id))" -Level Success
+        
+        if (Wait-Backend) {
+            Write-Log "Backend online!" -Level Success
+            return $true
+        }
+        else {
+            Write-Log "Backend nao respondeu" -Level Warning
+            return $false
+        }
+    }
+    catch {
+        Write-Log "Erro ao iniciar backend: $_" -Level Error
+        return $false
+    }
+    finally {
+        Pop-Location
+    }
+}
+
+function Wait-Backend {
+    Write-Log "Aguardando backend..." -Level Info
+    
+    for ($i = 0; $i -lt $HealthCheckTimeout; $i++) {
         try {
-            $body = @{ Message = $Message } | ConvertTo-Json
-            Invoke-RestMethod -Uri "$BackendUrl/api/logs" `
-                -Method Post `
-                -Body $body `
-                -ContentType "application/json" `
-                -TimeoutSec 2 | Out-Null
-            return # Sai da função se o envio for bem-sucedido
-        } catch {
-            if ($i -eq 2) {
-                Write-Host "  ⚠️ Não foi possível enviar log para a interface gráfica após 3 tentativas."
+            $response = Invoke-WebRequest "$BackendUrl/health" -TimeoutSec 2 -UseBasicParsing -ErrorAction Stop
+            if ($response.StatusCode -eq 200) {
+                return $true
             }
-            Start-Sleep -Seconds 1
+        }
+        catch {
+            # Continua tentando
+        }
+        
+        Start-Sleep -Seconds 1
+        
+        if (($i % 5) -eq 0 -and $i -gt 0) {
+            Write-Log "Aguardando... ($i/$HealthCheckTimeout seg)" -Level Info
+        }
+    }
+    
+    return $false
+}
+
+function Stop-Backend {
+    if ($script:BackendProcess -and -not $script:BackendProcess.HasExited) {
+        try {
+            Write-Log "Encerrando backend..." -Level Info
+            $script:BackendProcess.Kill()
+            $script:BackendProcess.WaitForExit(5000)
+            Write-Log "Backend encerrado" -Level Success
+        }
+        catch {
+            Write-Log "Erro ao encerrar backend: $_" -Level Warning
         }
     }
 }
 
-# Função para iniciar o backend em background para receber os logs
-function Start-Backend-For-Logs {
+# ==================================================
+# CRIACAO DE PROJETOS
+# ==================================================
+function New-Backend {
     param([string]$Path)
     
-    $backendPath = "$Path\backend"
+    Write-Log "Criando projeto Backend (.NET)..." -Level Header
     
-    if (Test-Path $backendPath) {
-        try {
-            Send-Log "  - Compilando o backend para garantir que está pronto..."
-            Set-Location $backendPath
-            dotnet build | Out-Null
-            
-            Send-Log "  - Iniciando o processo do backend em background..."
-            # Força a porta para evitar conflitos se a porta padrão 5000 estiver ocupada
-            $global:BackendProcess = Start-Process dotnet -ArgumentList "run --urls $BackendUrl" `
-                -WorkingDirectory $backendPath `
-                -WindowStyle Hidden `
-                -PassThru
-            
-            Send-Log "  - Backend iniciado para logs (PID: $($global:BackendProcess.Id)) em $BackendUrl"
-            
-            # Espera inteligente pelo backend responder, com timeout
-            Send-Log "  - Aguardando o backend ficar online..."
-            $timeout = 30 # segundos
-            $started = $false
-            for ($i = 0; $i -lt $timeout; $i++) {
-                try {
-                    # O endpoint /api/logs deve estar disponível
-                    $response = Invoke-WebRequest "$BackendUrl/api/logs" -TimeoutSec 2 -ErrorAction SilentlyContinue
-                    if ($response) {
-                        Send-Log "  - Backend está online!"
-                        $started = $true
-                        break
-                    }
-                } catch {}
-                Start-Sleep -Seconds 1
-            }
-            
-            if (-not $started) {
-                Send-Log "  ⚠️ ATENÇÃO: Backend não respondeu após $timeout segundos. A interface de logs pode não funcionar."
-            }
-            
-        } catch {
-            Send-Log "❌ Erro crítico ao tentar iniciar o backend para logs: $_"
-        } finally {
-            Set-Location $PSScriptRoot
+    $backendPath = Join-Path $Path "backend"
+    
+    try {
+        dotnet new webapi -n "backend" -o $backendPath --no-https --force | Out-Null
+        
+        if ($LASTEXITCODE -ne 0) {
+            throw "dotnet new falhou"
         }
+        
+        Write-Log "Projeto .NET criado" -Level Success
+        
+        # Copia templates
+        $templatePath = Join-Path $PSScriptRoot "templates\backend"
+        if (Test-Path $templatePath) {
+            Copy-Item "$templatePath\*" $backendPath -Recurse -Force -ErrorAction SilentlyContinue
+            
+            Get-ChildItem $backendPath -Recurse -Filter "*.txt" -ErrorAction SilentlyContinue | ForEach-Object {
+                $newName = $_.FullName -replace "\.txt$", ""
+                Rename-Item $_.FullName $newName -Force -ErrorAction SilentlyContinue
+            }
+            
+            Write-Log "Templates aplicados" -Level Success
+        }
+        
+        return $true
+    }
+    catch {
+        Write-Log "Erro ao criar backend: $_" -Level Error
+        return $false
     }
 }
 
-# Função para parar o backend de logs
-function Stop-Backend-For-Logs {
-    if ($global:BackendProcess -and (-not $global:BackendProcess.HasExited)) {
-        Send-Log "  - Encerrando o processo do backend de logs..."
-        $global:BackendProcess.Kill()
-        Send-Log "  - Processo do backend finalizado."
-    }
-}
-
-# Função para verificar se um comando existe
-function Test-CommandExists {
-    param([string]$command)
-    return (Get-Command $command -ErrorAction SilentlyContinue)
-}
-
-# Função para criar o projeto backend
-function Create-Backend-Project {
+function New-Frontend {
     param([string]$Path)
     
-    Send-Log "✨ Criando projeto Backend (.NET)..."
+    Write-Log "Criando projeto Frontend (Vite+React)..." -Level Header
     
-    if (-not (Test-CommandExists "dotnet")) {
-        Send-Log "❌ ERRO: .NET SDK não encontrado. Instale-o para continuar."
-        exit 1
-    }
+    $frontendPath = Join-Path $Path "frontend"
     
     try {
-        dotnet new webapi -n "backend" -o "$Path\backend" --no-https --force | Out-Null
-        Send-Log "  ✅ Projeto .NET criado com 'dotnet new'"
-    } catch {
-        Send-Log "  ❌ Falha ao executar 'dotnet new'. Detalhes: $_"
-        exit 1
+        if (Test-Path $frontendPath) {
+            Remove-Item $frontendPath -Recurse -Force
+        }
+        
+        npm create vite@latest $frontendPath -- --template react-ts | Out-Null
+        
+        if ($LASTEXITCODE -ne 0) {
+            throw "npm create vite falhou"
+        }
+        
+        Write-Log "Projeto Vite criado" -Level Success
+        
+        # Copia templates
+        $templatePath = Join-Path $PSScriptRoot "templates\frontend"
+        if (Test-Path $templatePath) {
+            Copy-Item "$templatePath\*" $frontendPath -Recurse -Force -ErrorAction SilentlyContinue
+            
+            Get-ChildItem $frontendPath -Recurse -Filter "*.txt" -ErrorAction SilentlyContinue | ForEach-Object {
+                $newName = $_.FullName -replace "\.txt$", ""
+                Rename-Item $_.FullName $newName -Force -ErrorAction SilentlyContinue
+            }
+            
+            Write-Log "Templates aplicados" -Level Success
+        }
+        
+        return $true
     }
-
-    Send-Log "  - Copiando arquivos de template do backend..."
-    $templatePath = Join-Path $PSScriptRoot "templates/backend"
-    Copy-Item -Path "$templatePath/*" -Destination "$Path\backend" -Recurse -Force
-    
-    Get-ChildItem -Path "$Path\backend" -Recurse -Filter *.txt | ForEach-Object {
-        $newName = $_.FullName.Replace(".txt", "")
-        Rename-Item -Path $_.FullName -NewName $newName -Force
+    catch {
+        Write-Log "Erro ao criar frontend: $_" -Level Error
+        return $false
     }
-
-    Send-Log "  ✅ Arquivos do Backend configurados."
 }
 
-# Função para criar o projeto frontend
-function Create-Frontend-Project {
-    param([string]$Path)
-    
-    Send-Log "✨ Criando projeto Frontend (Vite/React)..."
-    
-    if (-not (Test-CommandExists "npm")) {
-        Send-Log "❌ ERRO: Node.js/npm não encontrado. Instale-o para continuar."
-        exit 1
-    }
-    
-    try {
-        # O vite precisa de um diretório vazio ou inexistente
-        if(Test-Path "$Path\frontend"){ Remove-Item -Recurse -Force "$Path\frontend" }
-        npm create vite@latest "$Path\frontend" -- --template react-ts | Out-Null
-        Send-Log "  ✅ Projeto Vite/React criado com 'npm create vite'"
-    } catch {
-        Send-Log "  ❌ Falha ao executar 'npm create vite'. Detalhes: $_"
-        exit 1
-    }
-    
-    Send-Log "  - Copiando arquivos de template do frontend..."
-    $templatePath = Join-Path $PSScriptRoot "templates/frontend"
-    Copy-Item -Path "$templatePath/*" -Destination "$Path\frontend" -Recurse -Force
-
-    Get-ChildItem -Path "$Path\frontend" -Recurse -Filter *.txt | ForEach-Object {
-        $newName = $_.FullName.Replace(".txt", "")
-        Rename-Item -Path $_.FullName -NewName $newName -Force
-    }
-
-    Send-Log "  ✅ Arquivos do Frontend configurados."
-}
-
-# Função para criar arquivos de suporte
-function Create-Support-Files {
-    param([string]$Path)
-    
-    Send-Log "✨ Criando arquivos de suporte..."
-    
-    @"
-/node_modules
-/dist
-/build
-/publish
-/.vs
-/.vscode
-/bin
-/obj
-*.user
-*.suo
-app.db
-*.log
-"@ | Out-File -FilePath "$Path/.gitignore" -Encoding utf8
-    Send-Log "  - .gitignore criado."
-    
-    @"
-Write-Host "🚀 Full Stack Project Launcher"
-# Adicionar lógica de menu aqui se desejar
-# ...
-"@ | Out-File -FilePath "$Path/start.ps1" -Encoding utf8
-    Send-Log "  - start.ps1 criado."
-
-    @"
-# 🚀 Full Stack Project
-
-Projeto gerado com o FullStackInstaller.
-
-## Para começar
-
-1.  **Instale as dependências:**
-    *   `cd backend && dotnet restore`
-    *   `cd frontend && npm install`
-
-2.  **Execute os projetos:**
-    *   Backend: `cd backend && dotnet run`
-    *   Frontend: `cd frontend && npm run dev`
-"@ | Out-File -FilePath "$Path/README.md" -Encoding utf8
-    Send-Log "  - README.md criado."
-    
-    Send-Log "  ✅ Arquivos de suporte criados."
-}
-
-# Função para instalar dependências
+# ==================================================
+# DEPENDENCIAS
+# ==================================================
 function Install-Dependencies {
     param([string]$Path)
     
-    Send-Log "⚙️ Instalando dependências..."
+    Write-Log "Instalando dependencias..." -Level Header
     
+    # Backend
     try {
-        Send-Log "  - Restaurando pacotes .NET..."
-        Set-Location "$Path/backend"
-        dotnet restore | Out-Null
-        Send-Log "    ✅ Dependências do Backend instaladas."
-    } catch {
-        Send-Log "    ❌ Erro ao instalar dependências do Backend. Detalhes: $_"
+        Write-Log "Restaurando pacotes .NET..." -Level Info
+        Push-Location (Join-Path $Path "backend")
+        dotnet restore --verbosity quiet | Out-Null
+        Write-Log "Pacotes .NET OK" -Level Success
+    }
+    catch {
+        Write-Log "Erro ao restaurar .NET: $_" -Level Error
+    }
+    finally {
+        Pop-Location
     }
     
+    # Frontend
     try {
-        Send-Log "  - Instalando pacotes npm..."
-        Set-Location "$Path/frontend"
-        npm install | Out-Null
-        Send-Log "    ✅ Dependências do Frontend instaladas."
-    } catch {
-        Send-Log "    ❌ Erro ao instalar dependências do Frontend. Detalhes: $_"
+        Write-Log "Instalando pacotes npm..." -Level Info
+        Push-Location (Join-Path $Path "frontend")
+        npm install --silent | Out-Null
+        Write-Log "Pacotes npm OK" -Level Success
     }
-    
-    Set-Location $Path
-}
-
-
-# --- Função Principal ---
-function Main {
-    param([string]$ProjectDir)
-    
-    if ([string]::IsNullOrWhiteSpace($ProjectDir)) {
-        Send-Log "❌ ERRO: O diretório do projeto não foi fornecido."
-        Read-Host "Pressione Enter para sair"
-        exit 1
+    catch {
+        Write-Log "Erro ao instalar npm: $_" -Level Error
     }
-    
-    if (-not (Test-Path $ProjectDir)) {
-        Send-Log "  - Criando diretório do projeto em: $ProjectDir"
-        New-Item -ItemType Directory -Path $ProjectDir -Force | Out-Null
-    }
-    
-    Send-Log "🚀 Iniciando criação do projeto Full Stack em: $ProjectDir"
-    Send-Log ("-" * 60)
-    
-    # 1. Cria a estrutura base primeiro
-    Create-Backend-Project -Path $ProjectDir
-    Create-Frontend-Project -Path $ProjectDir
-    
-    # 2. Agora, inicia o backend para que ele possa receber os logs
-    Start-Backend-For-Logs -Path $ProjectDir
-    
-    # 3. Continua com o resto do setup, agora enviando logs
-    Create-Support-Files -Path $ProjectDir
-    Install-Dependencies -Path $ProjectDir
-    
-    Send-Log ("-" * 60)
-    Send-Log "✅ PROJETO CRIADO COM SUCESSO!"
-    Send-Log ("-" * 60)
-    Send-Log "📁 O projeto está em: $ProjectDir"
-    Send-Log "🚀 Para iniciar, navegue até a pasta e siga as instruções do README.md"
-    Send-Log "🎉 A interface com os logs da instalação pode ser vista no seu navegador."
-    
-    # 4. Para o processo do backend
-    Stop-Backend-For-Logs
-    
-    # Perguntar se quer abrir a pasta
-    $open = Read-Host "Deseja abrir a pasta do projeto no Windows Explorer? (S/N)"
-    if ($open -eq 'S' -or $open -eq 's') {
-        Invoke-Item $ProjectDir
+    finally {
+        Pop-Location
     }
 }
 
-# --- Execução ---
-# Tenta ler o caminho do projeto salvo pelo Inno Setup
+# ==================================================
+# ARQUIVOS DE SUPORTE
+# ==================================================
+function New-SupportFiles {
+    param([string]$Path)
+    
+    Write-Log "Criando arquivos de suporte..." -Level Header
+    
+    # .gitignore
+    $gitignore = @"
+node_modules/
+/dist
+/build
+/publish
+.vs/
+.vscode/
+*.user
+*.suo
+bin/
+obj/
+*.db
+*.log
+"@
+    
+    Set-Content -Path (Join-Path $Path ".gitignore") -Value $gitignore -Encoding UTF8
+    
+    # README.md
+    $readme = @"
+# Full Stack Project
+
+Projeto gerado com FullStackInstaller.
+
+## Como usar
+
+### Backend
+``````bash
+cd backend
+dotnet restore
+dotnet run
+``````
+
+### Frontend
+``````bash
+cd frontend
+npm install
+npm run dev
+``````
+
+## URLs
+- Frontend: http://localhost:5173
+- Backend: http://localhost:5000
+"@
+    
+    Set-Content -Path (Join-Path $Path "README.md") -Value $readme -Encoding UTF8
+    
+    Write-Log "Arquivos criados" -Level Success
+}
+
+# ==================================================
+# FUNCAO PRINCIPAL
+# ==================================================
+function Start-Setup {
+    param([string]$Dir)
+    
+    $success = $false
+    
+    try {
+        # Banner
+        Write-Host ""
+        Write-Host "================================================" -ForegroundColor Cyan
+        Write-Host "  FULL STACK INSTALLER v2.0" -ForegroundColor Cyan
+        Write-Host "  .NET + React + Vite + TypeScript" -ForegroundColor Cyan
+        Write-Host "================================================" -ForegroundColor Cyan
+        Write-Host ""
+        
+        # Valida diretorio
+        if ([string]::IsNullOrWhiteSpace($Dir)) {
+            Write-Log "Diretorio nao especificado" -Level Error
+            $Dir = Read-Host "Digite o caminho do projeto"
+            
+            if ([string]::IsNullOrWhiteSpace($Dir)) {
+                throw "Caminho invalido"
+            }
+        }
+        
+        Write-Log "Diretorio: $Dir" -Level Info
+        
+        # Cria diretorio
+        if (-not (Test-Path $Dir)) {
+            New-Item -ItemType Directory -Path $Dir -Force | Out-Null
+            Write-Log "Diretorio criado" -Level Success
+        }
+        
+        # Valida pre-requisitos
+        Test-Prerequisites
+        
+        Write-Host ""
+        Write-Log "INICIANDO INSTALACAO" -Level Header
+        Write-Host ""
+        
+        # Cria projetos
+        if (-not (New-Backend -Path $Dir)) {
+            throw "Falha ao criar backend"
+        }
+        
+        if (-not (New-Frontend -Path $Dir)) {
+            throw "Falha ao criar frontend"
+        }
+        
+        # Inicia backend
+        Start-Backend -Path $Dir | Out-Null
+        
+        # Cria suporte
+        New-SupportFiles -Path $Dir
+        
+        # Instala dependencias
+        Install-Dependencies -Path $Dir
+        
+        # Sucesso
+        Write-Host ""
+        Write-Log "PROJETO CRIADO COM SUCESSO!" -Level Success
+        Write-Host ""
+        Write-Log "Localizacao: $Dir" -Level Info
+        Write-Log "Consulte o README.md" -Level Info
+        Write-Host ""
+        
+        $success = $true
+        
+        # Pergunta se quer abrir
+        $response = Read-Host "Abrir pasta do projeto? (S/N)"
+        if ($response -match "^[Ss]$") {
+            Invoke-Item $Dir
+        }
+    }
+    catch {
+        Write-Host ""
+        Write-Log "ERRO DURANTE INSTALACAO" -Level Error
+        Write-Log $_.Exception.Message -Level Error
+        Write-Host ""
+    }
+    finally {
+        Stop-Backend
+        
+        Write-Host ""
+        Write-Log "Pressione ENTER para sair..." -Level Info
+        Read-Host
+    }
+    
+    return $success
+}
+
+# ==================================================
+# EXECUCAO
+# ==================================================
+
+# Le caminho salvo
 $projectPathFile = Join-Path $PSScriptRoot "project-path.txt"
-$savedProjectDir = ""
-if (Test-Path $projectPathFile) {
-    $savedProjectDir = Get-Content $projectPathFile -Raw
+if ([string]::IsNullOrWhiteSpace($ProjectDir) -and (Test-Path $projectPathFile)) {
+    $ProjectDir = (Get-Content $projectPathFile -Raw).Trim()
 }
 
-# Se o parâmetro não foi passado, usa o salvo.
-if ([string]::IsNullOrWhiteSpace($ProjectDir)) {
-    $ProjectDir = $savedProjectDir
-}
+# Executa
+$result = Start-Setup -Dir $ProjectDir
 
-Main -ProjectDir $ProjectDir
+# Exit code
+if ($result) {
+    exit 0
+}
+else {
+    exit 1
+}
